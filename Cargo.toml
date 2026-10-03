@@ -15,3 +15,5 @@ embedded-hal-async = { version = "1.0.0", optional = true }
 [features]
 default = []
 async = ["dep:embedded-hal-async"]
+rev-c2 = []
+si4467-68 = ["rev-c2"]
