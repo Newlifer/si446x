@@ -12,3 +12,7 @@ pub mod protocol;
 
 pub use device::CtsConfig;
 pub use error::Error;
+pub use protocol::{
+    command::{BootFunction, PowerUp},
+    response::{FuncInfo, PartInfo},
+};

@@ -3,7 +3,7 @@
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use embedded_hal::spi::Operation;
-use si446x::{CtsConfig, Error};
+use si446x::{CtsConfig, Error, FuncInfo, PartInfo, PowerUp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MockError;
@@ -196,6 +196,154 @@ macro_rules! transport_tests {
                 poll_interval_ns: 17,
             });
             (radio, Delay(script.clone()), script)
+        }
+
+        #[test]
+        fn typed_power_up_waits_for_completion_without_reading_data() {
+            let (mut radio, mut delay, script) = setup(vec![
+                cts(0xff),
+                Step::Spi(
+                    vec![Wire::Write(vec![0x02, 1, 0, 0x01, 0xc9, 0xc3, 0x80])],
+                    Ok(()),
+                ),
+                cts(0),
+                Step::Delay(17),
+                cts(0xff),
+            ]);
+            assert_eq!(run!(radio.power_up(PowerUp::default(), &mut delay)), Ok(()));
+            script.done();
+        }
+
+        #[test]
+        fn typed_power_up_rejects_invalid_frequency_without_io() {
+            let (mut radio, mut delay, script) = setup(vec![]);
+            for frequency in [0, 24_999_999, 32_000_001, u32::MAX] {
+                let config = PowerUp {
+                    xo_frequency_hz: frequency,
+                    ..PowerUp::default()
+                };
+                assert_eq!(
+                    run!(radio.power_up(config, &mut delay)),
+                    Err(Error::InvalidConfig)
+                );
+            }
+            script.done();
+        }
+
+        #[test]
+        fn typed_part_info_reads_exactly_eight_bytes_and_decodes_them() {
+            let (mut radio, mut delay, script) = setup(vec![
+                cts(0xff),
+                request(),
+                cts(0xff),
+                Step::Spi(
+                    vec![
+                        Wire::Write(vec![0x44]),
+                        Wire::Read(vec![0xff]),
+                        Wire::Read(vec![0x11, 0x44, 0x60, 0x22, 0x12, 0x34, 0x33, 0x06]),
+                    ],
+                    Ok(()),
+                ),
+            ]);
+            assert_eq!(
+                run!(radio.part_info(&mut delay)),
+                Ok(PartInfo {
+                    chip_revision: 0x11,
+                    part: 0x4460,
+                    part_build: 0x22,
+                    id: 0x1234,
+                    customer: 0x33,
+                    rom_id: 0x06,
+                })
+            );
+            script.done();
+        }
+
+        #[test]
+        fn typed_func_info_reads_exactly_six_bytes_and_decodes_them() {
+            let (mut radio, mut delay, script) = setup(vec![
+                cts(0xff),
+                Step::Spi(vec![Wire::Write(vec![0x10])], Ok(())),
+                cts(0xff),
+                Step::Spi(
+                    vec![
+                        Wire::Write(vec![0x44]),
+                        Wire::Read(vec![0xff]),
+                        Wire::Read(vec![3, 4, 5, 0xab, 0xcd, 1]),
+                    ],
+                    Ok(()),
+                ),
+            ]);
+            assert_eq!(
+                run!(radio.func_info(&mut delay)),
+                Ok(FuncInfo {
+                    revision_external: 3,
+                    revision_branch: 4,
+                    revision_internal: 5,
+                    patch: 0xabcd,
+                    function: 1,
+                })
+            );
+            script.done();
+        }
+
+        #[test]
+        fn typed_methods_propagate_spi_errors() {
+            let (mut radio, mut delay, script) = setup(vec![failing(cts(0xff))]);
+            assert_eq!(
+                run!(radio.power_up(PowerUp::default(), &mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+            let (mut radio, mut delay, script) = setup(vec![cts(0xff), failing(request())]);
+            assert_eq!(
+                run!(radio.part_info(&mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+            let (mut radio, mut delay, script) = setup(vec![
+                cts(0xff),
+                Step::Spi(vec![Wire::Write(vec![0x10])], Ok(())),
+                failing(cts(0xff)),
+            ]);
+            assert_eq!(
+                run!(radio.func_info(&mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+        }
+
+        #[test]
+        fn typed_identification_does_not_return_data_when_response_cts_is_invalid() {
+            for part_info in [true, false] {
+                let opcode = if part_info { 0x01 } else { 0x10 };
+                let length = if part_info { 8 } else { 6 };
+                let (mut radio, mut delay, script) = setup(vec![
+                    cts(0xff),
+                    Step::Spi(vec![Wire::Write(vec![opcode])], Ok(())),
+                    cts(0xff),
+                    Step::Spi(
+                        vec![
+                            Wire::Write(vec![0x44]),
+                            Wire::Read(vec![0]),
+                            Wire::Read(vec![0; length]),
+                        ],
+                        Ok(()),
+                    ),
+                ]);
+                if part_info {
+                    assert_eq!(
+                        run!(radio.part_info(&mut delay)),
+                        Err(Error::InvalidResponse)
+                    );
+                } else {
+                    assert_eq!(
+                        run!(radio.func_info(&mut delay)),
+                        Err(Error::InvalidResponse)
+                    );
+                }
+                script.done();
+            }
         }
 
         #[test]

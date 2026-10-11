@@ -4,10 +4,10 @@ use embedded_hal::{digital::OutputPin, spi::Operation};
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
 use crate::{
-    CtsConfig,
+    CtsConfig, FuncInfo, PartInfo, PowerUp,
     device::Device,
     error::Error,
-    protocol::{opcode::READ_CMD_BUFF, response::is_cts_ready},
+    protocol::{command, opcode::READ_CMD_BUFF, response::is_cts_ready},
 };
 
 /// Asynchronous Si446x driver.
@@ -44,6 +44,47 @@ where
     SPI: SpiDevice<u8>,
     SDN: OutputPin,
 {
+    /// Boots the selected firmware image after hardware reset.
+    ///
+    /// Returns `InvalidConfig` without SPI I/O for an oscillator frequency
+    /// outside 25–32 MHz. Waits for command completion, but does not configure
+    /// radio properties or download a patch. See [`Self::command`] for error
+    /// recovery and cancellation behavior.
+    pub async fn power_up<D: DelayNs>(
+        &mut self,
+        config: PowerUp,
+        delay: &mut D,
+    ) -> Result<(), Error<SPI::Error, SDN::Error>> {
+        let request = config.encode().ok_or(Error::InvalidConfig)?;
+        self.command(&request, &mut [], delay).await
+    }
+
+    /// Reads chip identification information.
+    ///
+    /// Has the same cancellation behavior as [`Self::command`].
+    pub async fn part_info<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<PartInfo, Error<SPI::Error, SDN::Error>> {
+        let mut bytes = [0; PartInfo::LEN];
+        self.command(&command::PartInfo.encode(), &mut bytes, delay)
+            .await?;
+        Ok(PartInfo::from_bytes(bytes))
+    }
+
+    /// Reads the currently loaded firmware information.
+    ///
+    /// Has the same cancellation behavior as [`Self::command`].
+    pub async fn func_info<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<FuncInfo, Error<SPI::Error, SDN::Error>> {
+        let mut bytes = [0; FuncInfo::LEN];
+        self.command(&command::FuncInfo.encode(), &mut bytes, delay)
+            .await?;
+        Ok(FuncInfo::from_bytes(bytes))
+    }
+
     /// Performs a hardware reset through the SDN pin.
     ///
     /// If cancelled, the reset sequence may be incomplete (including SDN left

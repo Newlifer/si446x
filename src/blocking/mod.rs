@@ -7,10 +7,10 @@ use embedded_hal::{
 };
 
 use crate::{
-    CtsConfig,
+    CtsConfig, FuncInfo, PartInfo, PowerUp,
     device::Device,
     error::Error,
-    protocol::{opcode::READ_CMD_BUFF, response::is_cts_ready},
+    protocol::{command, opcode::READ_CMD_BUFF, response::is_cts_ready},
 };
 
 /// Blocking Si446x driver.
@@ -47,6 +47,59 @@ where
     SPI: SpiDevice<u8>,
     SDN: OutputPin,
 {
+    /// Boots the selected firmware image after hardware reset.
+    ///
+    /// Returns `InvalidConfig` without SPI I/O for an oscillator frequency
+    /// outside 25–32 MHz. Waits for command completion, but does not configure
+    /// radio properties or download a patch. See [`Self::command`] for error
+    /// recovery behavior.
+    ///
+    /// ```no_run
+    /// use embedded_hal::{delay::DelayNs, digital::OutputPin, spi::SpiDevice};
+    /// use si446x::{Error, FuncInfo, PartInfo, PowerUp, blocking::Si446x};
+    ///
+    /// fn identify<SPI: SpiDevice<u8>, SDN: OutputPin, D: DelayNs>(
+    ///     radio: &mut Si446x<SPI, SDN>,
+    ///     delay: &mut D,
+    /// ) -> Result<(PartInfo, FuncInfo), Error<SPI::Error, SDN::Error>> {
+    ///     radio.reset(delay)?;
+    ///     let config = PowerUp {
+    ///         xo_frequency_hz: 30_000_000, // Must match the board oscillator.
+    ///         ..PowerUp::default()
+    ///     };
+    ///     radio.power_up(config, delay)?;
+    ///     Ok((radio.part_info(delay)?, radio.func_info(delay)?))
+    /// }
+    /// ```
+    pub fn power_up<D: DelayNs>(
+        &mut self,
+        config: PowerUp,
+        delay: &mut D,
+    ) -> Result<(), Error<SPI::Error, SDN::Error>> {
+        let request = config.encode().ok_or(Error::InvalidConfig)?;
+        self.command(&request, &mut [], delay)
+    }
+
+    /// Reads chip identification information.
+    pub fn part_info<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<PartInfo, Error<SPI::Error, SDN::Error>> {
+        let mut bytes = [0; PartInfo::LEN];
+        self.command(&command::PartInfo.encode(), &mut bytes, delay)?;
+        Ok(PartInfo::from_bytes(bytes))
+    }
+
+    /// Reads the currently loaded firmware information.
+    pub fn func_info<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<FuncInfo, Error<SPI::Error, SDN::Error>> {
+        let mut bytes = [0; FuncInfo::LEN];
+        self.command(&command::FuncInfo.encode(), &mut bytes, delay)?;
+        Ok(FuncInfo::from_bytes(bytes))
+    }
+
     /// Performs a hardware reset through the SDN pin.
     pub fn reset<D: DelayNs>(
         &mut self,
