@@ -45,6 +45,9 @@ where
     SDN: OutputPin,
 {
     /// Performs a hardware reset through the SDN pin.
+    ///
+    /// If cancelled, the reset sequence may be incomplete (including SDN left
+    /// high). Complete a new reset before using the radio again.
     pub async fn reset<D: DelayNs>(
         &mut self,
         delay: &mut D,
@@ -57,6 +60,23 @@ where
     }
 
     /// Sends a raw command and reads its response after CTS becomes ready.
+    ///
+    /// Waits for CTS before writing the request and again before reading its
+    /// response, including for commands with no response bytes. The attempt
+    /// limit applies independently to each wait. Invalid inputs cause no SPI I/O.
+    /// After a timeout, a subsequent call checks CTS again before sending.
+    /// An error does not undo a command already sent, and response contents are
+    /// unspecified on error.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation does not undo a request already sent. If cancelled during
+    /// a polling delay, the next call waits for CTS before sending, but the
+    /// previous response is abandoned. Cancellation during SPI I/O depends on
+    /// the HAL's cancellation guarantees: the transfer may be partial or CS may
+    /// remain asserted. Restore the SPI device as required by the HAL, then
+    /// reset and reinitialize the radio if its state is uncertain. The same
+    /// recovery applies after SPI errors. This driver does not cache readiness.
     pub async fn command<D: DelayNs>(
         &mut self,
         request: &[u8],
@@ -66,6 +86,7 @@ where
         if request.is_empty() {
             return Err(Error::InvalidCommand);
         }
+        self.wait_cts(delay).await?;
         self.write_request(request).await?;
         self.wait_cts(delay).await?;
         if !response.is_empty() {

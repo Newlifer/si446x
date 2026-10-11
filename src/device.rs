@@ -1,7 +1,8 @@
 /// Configuration for polling the command-ready (CTS) byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CtsConfig {
-    /// Maximum number of `READ_CMD_BUFF` attempts.
+    /// Maximum number of `READ_CMD_BUFF` attempts per wait, before and after
+    /// sending a command. Zero is invalid and prevents command SPI I/O.
     pub max_attempts: u16,
     /// Delay between attempts, in nanoseconds.
     pub poll_interval_ns: u32,

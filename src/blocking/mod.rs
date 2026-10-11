@@ -60,6 +60,14 @@ where
     }
 
     /// Sends a raw command and reads its response after CTS becomes ready.
+    ///
+    /// Waits for CTS before writing the request and again before reading its
+    /// response, including for commands with no response bytes. The attempt
+    /// limit applies independently to each wait. Invalid inputs cause no SPI I/O.
+    /// After a timeout, a subsequent call checks CTS again before sending.
+    /// After an SPI error the request may have been partially sent; reset and
+    /// reinitialize the radio if its state is uncertain. An error does not undo
+    /// a command already sent, and response contents are unspecified on error.
     pub fn command<D: DelayNs>(
         &mut self,
         request: &[u8],
@@ -69,6 +77,7 @@ where
         if request.is_empty() {
             return Err(Error::InvalidCommand);
         }
+        self.wait_cts(delay)?;
         self.write_request(request)?;
         self.wait_cts(delay)?;
         if !response.is_empty() {
