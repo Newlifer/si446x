@@ -3,7 +3,10 @@
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use embedded_hal::spi::Operation;
-use si446x::{CtsConfig, Error, FuncInfo, PartInfo, PowerUp};
+use si446x::{
+    ConfigurationError, CtsConfig, DeviceState, DriveStrength, Error, FuncInfo, GpioPinConfig,
+    GpioPinStatus, PartInfo, PinConfig, PowerUp, State,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MockError;
@@ -53,6 +56,25 @@ fn response(status: u8) -> Step {
         ],
         Ok(()),
     )
+}
+
+fn exchange(request: &[u8], data: &[u8]) -> Vec<Step> {
+    let mut steps = vec![
+        cts(0xff),
+        Step::Spi(vec![Wire::Write(request.to_vec())], Ok(())),
+        cts(0xff),
+    ];
+    if !data.is_empty() {
+        steps.push(Step::Spi(
+            vec![
+                Wire::Write(vec![0x44]),
+                Wire::Read(vec![0xff]),
+                Wire::Read(data.to_vec()),
+            ],
+            Ok(()),
+        ));
+    }
+    steps
 }
 
 fn failing(mut step: Step) -> Step {
@@ -196,6 +218,282 @@ macro_rules! transport_tests {
                 poll_interval_ns: 17,
             });
             (radio, Delay(script.clone()), script)
+        }
+
+        #[test]
+        fn properties_write_and_read_the_requested_range() {
+            let mut steps = exchange(&[0x11, 0x20, 2, 0x10, 0xaa, 0xbb], &[]);
+            steps.extend(exchange(&[0x12, 0x20, 2, 0x10], &[0xaa, 0xbb]));
+            let (mut radio, mut delay, script) = setup(steps);
+            assert_eq!(
+                run!(radio.set_property(0x20, 0x10, &[0xaa, 0xbb], &mut delay)),
+                Ok(())
+            );
+            let mut values = [0; 2];
+            assert_eq!(
+                run!(radio.get_property(0x20, 0x10, &mut values, &mut delay)),
+                Ok(())
+            );
+            assert_eq!(values, [0xaa, 0xbb]);
+            script.done();
+        }
+
+        #[test]
+        fn properties_accept_maximum_counts_at_group_end() {
+            let mut request = vec![0x11, 0x20, 12, 244];
+            request.extend([0xab; 12]);
+            let mut steps = exchange(&request, &[]);
+            steps.extend(exchange(&[0x12, 0x20, 16, 240], &[0xcd; 16]));
+            let (mut radio, mut delay, script) = setup(steps);
+            assert_eq!(
+                run!(radio.set_property(0x20, 244, &[0xab; 12], &mut delay)),
+                Ok(())
+            );
+            let mut values = [0; 16];
+            assert_eq!(
+                run!(radio.get_property(0x20, 240, &mut values, &mut delay)),
+                Ok(())
+            );
+            assert_eq!(values, [0xcd; 16]);
+            script.done();
+        }
+
+        #[test]
+        fn invalid_property_ranges_cause_no_io() {
+            let (mut radio, mut delay, script) = setup(vec![]);
+            for (start, count) in [(0, 0), (0, 13), (255, 2)] {
+                assert_eq!(
+                    run!(radio.set_property(0x20, start, &vec![0; count], &mut delay)),
+                    Err(Error::InvalidConfig)
+                );
+            }
+            for (start, count) in [(0, 0), (0, 17), (255, 2), (0, 257)] {
+                assert_eq!(
+                    run!(radio.get_property(0x20, start, &mut vec![0; count], &mut delay)),
+                    Err(Error::InvalidConfig)
+                );
+            }
+            script.done();
+        }
+
+        #[test]
+        fn configuration_with_invalid_cts_settings_performs_no_spi_io() {
+            let (mut radio, mut delay, script) = setup(vec![]);
+            radio.set_cts_config(CtsConfig {
+                max_attempts: 0,
+                poll_interval_ns: 0,
+            });
+            assert_eq!(
+                run!(radio.load_configuration(&[2, 0x34, 3, 0], &mut delay)),
+                Err(Error::InvalidConfig)
+            );
+            assert_eq!(
+                run!(radio.change_state(State::Sleep, &mut delay)),
+                Err(Error::InvalidConfig)
+            );
+            script.done();
+        }
+
+        #[test]
+        fn configuration_is_fully_validated_before_any_spi_operation() {
+            let (mut radio, mut delay, script) = setup(vec![]);
+            assert_eq!(
+                run!(radio.load_configuration(&[5, 0x11, 0x20, 1, 0, 3, 2, 0x34], &mut delay)),
+                Err(Error::InvalidConfiguration(ConfigurationError::Truncated {
+                    offset: 6
+                }))
+            );
+            assert_eq!(
+                run!(radio.load_configuration(&[1, 0, 2, 0x34, 4, 0], &mut delay)),
+                Err(Error::InvalidConfiguration(
+                    ConfigurationError::InvalidCommand { offset: 2 }
+                ))
+            );
+            assert_eq!(run!(radio.load_configuration(&[0], &mut delay)), Ok(()));
+            script.done();
+        }
+
+        #[test]
+        fn configuration_executes_records_in_order_and_discards_response_data() {
+            let mut steps = exchange(&[0x11, 0x20, 1, 0, 3], &[]);
+            steps.extend(exchange(&[0x13, 4, 8, 0, 0, 39, 11, 0], &[]));
+            steps.extend(exchange(&[0x34, 3], &[]));
+            let (mut radio, mut delay, script) = setup(steps);
+            let bytes = [
+                5, 0x11, 0x20, 1, 0, 3, 8, 0x13, 4, 8, 0, 0, 39, 11, 0, 2, 0x34, 3, 0,
+            ];
+            assert_eq!(run!(radio.load_configuration(&bytes, &mut delay)), Ok(()));
+            script.done();
+        }
+
+        #[test]
+        fn configuration_stops_on_spi_error_and_does_not_send_later_records() {
+            let mut steps = exchange(&[0x11, 0x20, 1, 0, 3], &[]);
+            steps.extend([
+                cts(0xff),
+                failing(Step::Spi(vec![Wire::Write(vec![0x34, 3])], Ok(()))),
+            ]);
+            let (mut radio, mut delay, script) = setup(steps);
+            assert_eq!(
+                run!(radio.load_configuration(
+                    &[5, 0x11, 0x20, 1, 0, 3, 2, 0x34, 3, 1, 0, 0],
+                    &mut delay
+                )),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+        }
+
+        #[test]
+        fn configuration_stops_on_cts_timeout() {
+            let (mut radio, mut delay, script) = setup(vec![
+                cts(0xff),
+                Step::Spi(vec![Wire::Write(vec![0x34, 3])], Ok(())),
+                cts(0),
+                Step::Delay(17),
+                cts(0),
+                Step::Delay(17),
+                cts(0),
+            ]);
+            assert_eq!(
+                run!(radio.load_configuration(&[2, 0x34, 3, 1, 0, 0], &mut delay)),
+                Err(Error::CtsTimeout)
+            );
+            script.done();
+        }
+
+        #[test]
+        fn gpio_configuration_reads_modes_levels_and_drive_strength() {
+            let reply = [0x84, 8, 0xc2, 3, 0xa7, 11, 0xa0];
+            let (mut radio, mut delay, script) =
+                setup(exchange(&[0x13, 4, 0x48, 2, 3, 39, 11, 0x20], &reply));
+            let config = GpioPinConfig {
+                gpio: [
+                    PinConfig::INPUT,
+                    PinConfig {
+                        mode: 8,
+                        pull_up: true,
+                    },
+                    PinConfig::LOW,
+                    PinConfig::HIGH,
+                ],
+                nirq: PinConfig::NIRQ,
+                sdo: PinConfig::SDO,
+                drive_strength: DriveStrength::MediumHigh,
+            };
+            assert_eq!(
+                run!(radio.gpio_pin_cfg(config, &mut delay)),
+                Ok(GpioPinStatus::from_bytes(reply))
+            );
+            script.done();
+        }
+
+        #[test]
+        fn invalid_gpio_modes_cause_no_io() {
+            let (mut radio, mut delay, script) = setup(vec![]);
+            for config in [
+                GpioPinConfig {
+                    gpio: [PinConfig {
+                        mode: 30,
+                        pull_up: false,
+                    }; 4],
+                    ..GpioPinConfig::default()
+                },
+                GpioPinConfig {
+                    nirq: PinConfig {
+                        mode: 5,
+                        pull_up: false,
+                    },
+                    ..GpioPinConfig::default()
+                },
+                GpioPinConfig {
+                    sdo: PinConfig::NIRQ,
+                    ..GpioPinConfig::default()
+                },
+            ] {
+                assert_eq!(
+                    run!(radio.gpio_pin_cfg(config, &mut delay)),
+                    Err(Error::InvalidConfig)
+                );
+            }
+            script.done();
+        }
+
+        #[test]
+        fn state_change_and_query_decode_the_current_state_and_channel() {
+            let mut steps = exchange(&[0x34, 3], &[]);
+            steps.extend(exchange(&[0x33], &[0xa4, 17]));
+            let (mut radio, mut delay, script) = setup(steps);
+            assert_eq!(run!(radio.change_state(State::Ready, &mut delay)), Ok(()));
+            assert_eq!(
+                run!(radio.request_device_state(&mut delay)),
+                Ok(DeviceState {
+                    main_state: 4,
+                    channel: 17
+                })
+            );
+            script.done();
+        }
+
+        #[test]
+        fn sleep_is_not_followed_by_a_waking_spi_poll() {
+            let (mut radio, mut delay, script) = setup(vec![
+                cts(0),
+                Step::Delay(17),
+                cts(0xff),
+                Step::Spi(vec![Wire::Write(vec![0x34, 1])], Ok(())),
+            ]);
+            assert_eq!(run!(radio.change_state(State::Sleep, &mut delay)), Ok(()));
+            script.done();
+        }
+
+        #[test]
+        fn final_sleep_in_configuration_is_not_followed_by_spi_poll() {
+            let mut steps = exchange(&[0x34, 3], &[]);
+            steps.extend([
+                cts(0xff),
+                Step::Spi(vec![Wire::Write(vec![0x34, 1])], Ok(())),
+            ]);
+            let (mut radio, mut delay, script) = setup(steps);
+            assert_eq!(
+                run!(radio.load_configuration(&[2, 0x34, 3, 2, 0x34, 1, 0], &mut delay)),
+                Ok(())
+            );
+            script.done();
+        }
+
+        #[test]
+        fn new_commands_propagate_transport_errors() {
+            let (mut radio, mut delay, script) = setup(vec![failing(cts(0xff))]);
+            assert_eq!(
+                run!(radio.set_property(0, 0, &[1], &mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+            let (mut radio, mut delay, script) = setup(vec![failing(cts(0xff))]);
+            assert_eq!(
+                run!(radio.get_property(0, 0, &mut [0], &mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+            let (mut radio, mut delay, script) = setup(vec![failing(cts(0xff))]);
+            assert_eq!(
+                run!(radio.gpio_pin_cfg(GpioPinConfig::default(), &mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+            let (mut radio, mut delay, script) = setup(vec![failing(cts(0xff))]);
+            assert_eq!(
+                run!(radio.change_state(State::Sleep, &mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
+            let (mut radio, mut delay, script) = setup(vec![failing(cts(0xff))]);
+            assert_eq!(
+                run!(radio.request_device_state(&mut delay)),
+                Err(Error::Spi(MockError))
+            );
+            script.done();
         }
 
         #[test]
@@ -646,6 +944,19 @@ mod asynch {
         let mut context = Context::from_waker(Waker::noop());
         assert!(pin!(future).poll(&mut context).is_pending());
         // Drop the future while suspended to release its driver borrow.
+    }
+
+    #[test]
+    fn cancelled_configuration_does_not_send_later_commands() {
+        let (mut radio, _, script) = setup(vec![
+            cts(0xff),
+            Step::Spi(vec![Wire::Write(vec![0x34, 3])], Ok(())),
+            cts(0),
+            Step::Delay(17),
+        ]);
+        let mut suspended = SuspendedDelay(script.clone());
+        cancel_pending(radio.load_configuration(&[2, 0x34, 3, 1, 0, 0], &mut suspended));
+        script.done();
     }
 
     #[test]

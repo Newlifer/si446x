@@ -6,13 +6,17 @@
 #[cfg(feature = "async")]
 pub mod asynch;
 pub mod blocking;
+pub mod configuration;
 mod device;
 pub mod error;
 pub mod protocol;
 
+pub use configuration::{Configuration, ConfigurationError};
 pub use device::CtsConfig;
 pub use error::Error;
 pub use protocol::{
-    command::{BootFunction, PowerUp},
-    response::{FuncInfo, PartInfo},
+    command::{BootFunction, GetProperty, PowerUp, SetProperty},
+    gpio::{DriveStrength, GpioPinConfig, PinConfig},
+    response::{DeviceState, FuncInfo, GpioPinStatus, PartInfo, PinStatus},
+    state::State,
 };

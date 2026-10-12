@@ -15,4 +15,6 @@ pub enum Error<SpiError, SdnError> {
     InvalidCommand,
     /// The driver configuration is invalid.
     InvalidConfig,
+    /// A prepared command stream failed structural validation before SPI I/O.
+    InvalidConfiguration(crate::configuration::ConfigurationError),
 }

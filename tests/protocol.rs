@@ -1,5 +1,192 @@
 use si446x::{BootFunction, FuncInfo, PartInfo, PowerUp, protocol::command};
 
+use si446x::{
+    DeviceState, DriveStrength, GetProperty, GpioPinConfig, GpioPinStatus, PinConfig, PinStatus,
+    SetProperty, State,
+};
+
+#[test]
+fn property_commands_encode_counts_and_only_used_data() {
+    let encoded = SetProperty {
+        group: 0x20,
+        start: 0x10,
+        values: &[0xaa, 0xbb],
+    }
+    .encode();
+    assert!(encoded.is_some());
+    if let Some((bytes, length)) = encoded {
+        assert_eq!(length, 6);
+        assert_eq!(&bytes[..length], &[0x11, 0x20, 2, 0x10, 0xaa, 0xbb]);
+    }
+    assert_eq!(
+        GetProperty {
+            group: 0x20,
+            start: 240,
+            count: 16
+        }
+        .encode(),
+        Some([0x12, 0x20, 16, 240])
+    );
+}
+
+#[test]
+fn property_ranges_validate_count_and_end_of_group() {
+    for (start, count, valid) in [
+        (0, 0, false),
+        (0, 1, true),
+        (244, 12, true),
+        (245, 12, false),
+        (0, 13, false),
+        (255, 1, true),
+        (255, 2, false),
+    ] {
+        assert_eq!(
+            SetProperty {
+                group: 0,
+                start,
+                values: &vec![0; count]
+            }
+            .encode()
+            .is_some(),
+            valid
+        );
+    }
+    for (start, count, valid) in [
+        (0, 0, false),
+        (240, 16, true),
+        (241, 16, false),
+        (0, 17, false),
+        (255, 1, true),
+        (255, 2, false),
+    ] {
+        assert_eq!(
+            GetProperty {
+                group: 0,
+                start,
+                count
+            }
+            .encode()
+            .is_some(),
+            valid
+        );
+    }
+}
+
+#[test]
+fn gpio_encodes_pin_modes_pullups_and_drive_strength() {
+    let config = GpioPinConfig {
+        gpio: [
+            PinConfig::INPUT,
+            PinConfig {
+                mode: 8,
+                pull_up: true,
+            },
+            PinConfig::LOW,
+            PinConfig::HIGH,
+        ],
+        nirq: PinConfig::NIRQ,
+        sdo: PinConfig::SDO,
+        drive_strength: DriveStrength::Low,
+    };
+    assert_eq!(config.encode(), Some([0x13, 4, 0x48, 2, 3, 39, 11, 0x60]));
+    assert_eq!(
+        GpioPinConfig::default().encode(),
+        Some([0x13, 0, 0, 0, 0, 0, 0, 0])
+    );
+}
+
+#[test]
+fn gpio_checks_mode_sets_per_pin_and_reserved_bits() {
+    for mode in 0..=255 {
+        let pin = PinConfig {
+            mode,
+            pull_up: true,
+        };
+        let mut config = GpioPinConfig::default();
+        config.gpio[0] = pin;
+        assert_eq!(config.encode().is_some(), matches!(mode, 0..=29 | 31..=39));
+        config = GpioPinConfig {
+            nirq: pin,
+            ..GpioPinConfig::default()
+        };
+        assert_eq!(
+            config.encode().is_some(),
+            matches!(mode, 0..=4 | 7 | 8 | 11 | 12 | 15..=27 | 29 | 31 | 39)
+        );
+        config = GpioPinConfig {
+            sdo: pin,
+            ..GpioPinConfig::default()
+        };
+        assert_eq!(
+            config.encode().is_some(),
+            matches!(mode, 0..=5 | 7 | 8 | 11 | 12 | 14..=27)
+        );
+    }
+}
+
+#[test]
+fn gpio_reply_uses_bit_seven_for_level_and_ignores_undefined_bits() {
+    let status = GpioPinStatus::from_bytes([0xc4, 8, 0x82, 3, 0xa7, 0xcb, 0xff]);
+    assert_eq!(
+        status.gpio[0],
+        PinStatus {
+            mode: 4,
+            high: true
+        }
+    );
+    assert_eq!(
+        status.gpio[1],
+        PinStatus {
+            mode: 8,
+            high: false
+        }
+    );
+    assert_eq!(
+        status.nirq,
+        PinStatus {
+            mode: 39,
+            high: true
+        }
+    );
+    assert_eq!(
+        status.sdo,
+        PinStatus {
+            mode: 11,
+            high: true
+        }
+    );
+    assert_eq!(status.drive_strength, DriveStrength::Low);
+    assert_eq!(
+        PinStatus::from_byte(0x7f),
+        PinStatus {
+            mode: 63,
+            high: false
+        }
+    );
+}
+
+#[test]
+fn device_state_masks_undefined_bits_and_preserves_unknown_codes() {
+    let status = DeviceState::from_bytes([0xf4, 0x91]);
+    assert_eq!(status.main_state, 4);
+    assert_eq!(status.channel, 0x91);
+    assert_eq!(status.state(), Some(State::Ready));
+    assert_eq!(DeviceState::from_bytes([0xff, 0]).state(), None);
+    assert_eq!(command::RequestDeviceState.encode(), [0x33]);
+    for (state, byte) in [
+        (State::NoChange, 0),
+        (State::Sleep, 1),
+        (State::SpiActive, 2),
+        (State::Ready, 3),
+        (State::TxTune, 5),
+        (State::RxTune, 6),
+        (State::Tx, 7),
+        (State::Rx, 8),
+    ] {
+        assert_eq!(command::ChangeState(state).encode(), [0x34, byte]);
+    }
+}
+
 #[test]
 fn default_power_up_matches_30_mhz_application_boot() {
     assert_eq!(

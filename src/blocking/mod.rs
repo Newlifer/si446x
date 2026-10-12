@@ -7,7 +7,8 @@ use embedded_hal::{
 };
 
 use crate::{
-    CtsConfig, FuncInfo, PartInfo, PowerUp,
+    Configuration, CtsConfig, DeviceState, FuncInfo, GetProperty, GpioPinConfig, GpioPinStatus,
+    PartInfo, PowerUp, SetProperty, State,
     device::Device,
     error::Error,
     protocol::{command, opcode::READ_CMD_BUFF, response::is_cts_ready},
@@ -47,6 +48,123 @@ where
     SPI: SpiDevice<u8>,
     SDN: OutputPin,
 {
+    /// Writes 1–12 contiguous properties within a single group.
+    ///
+    /// Empty/oversized writes and group-boundary crossing return `InvalidConfig`
+    /// before SPI I/O. Property IDs and values remain the caller's responsibility.
+    pub fn set_property<D: DelayNs>(
+        &mut self,
+        group: u8,
+        start: u8,
+        values: &[u8],
+        delay: &mut D,
+    ) -> Result<(), Error<SPI::Error, SDN::Error>> {
+        let (request, length) = SetProperty {
+            group,
+            start,
+            values,
+        }
+        .encode()
+        .ok_or(Error::InvalidConfig)?;
+        self.command(&request[..length], &mut [], delay)
+    }
+
+    /// Reads 1–16 contiguous properties into the caller's buffer.
+    ///
+    /// The buffer length determines the count. Invalid counts and group-boundary
+    /// crossing return `InvalidConfig` before SPI I/O. Buffer contents are
+    /// unspecified after a transport error.
+    pub fn get_property<D: DelayNs>(
+        &mut self,
+        group: u8,
+        start: u8,
+        values: &mut [u8],
+        delay: &mut D,
+    ) -> Result<(), Error<SPI::Error, SDN::Error>> {
+        let count = u8::try_from(values.len()).map_err(|_| Error::InvalidConfig)?;
+        let request = GetProperty {
+            group,
+            start,
+            count,
+        }
+        .encode()
+        .ok_or(Error::InvalidConfig)?;
+        self.command(&request, values, delay)
+    }
+
+    /// Validates and loads a WDS-style length-prefixed command stream.
+    ///
+    /// The entire stream is validated before the first SPI operation. Commands
+    /// execute in order, with CTS waits; response data is discarded. Does not
+    /// implicitly reset or power up the radio. SPI/CTS failures stop loading,
+    /// leaving earlier commands applied; reset and reinitialize before retrying
+    /// if the state is uncertain. See [`Configuration`] for the format and limits.
+    /// `CHANGE_STATE(SLEEP)` skips the completion poll as in [`Self::change_state`].
+    pub fn load_configuration<D: DelayNs>(
+        &mut self,
+        bytes: &[u8],
+        delay: &mut D,
+    ) -> Result<(), Error<SPI::Error, SDN::Error>> {
+        let config = Configuration::new(bytes).map_err(Error::InvalidConfiguration)?;
+        for request in config.commands() {
+            if request == command::ChangeState(State::Sleep).encode() {
+                self.change_state(State::Sleep, delay)?;
+            } else {
+                self.command(request, &mut [], delay)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Configures GPIO/NIRQ/SDO pins and returns their current modes and levels.
+    ///
+    /// Invalid per-pin mode codes return `InvalidConfig` before SPI I/O.
+    pub fn gpio_pin_cfg<D: DelayNs>(
+        &mut self,
+        config: GpioPinConfig,
+        delay: &mut D,
+    ) -> Result<GpioPinStatus, Error<SPI::Error, SDN::Error>> {
+        let request = config.encode().ok_or(Error::InvalidConfig)?;
+        let mut bytes = [0; GpioPinStatus::LEN];
+        self.command(&request, &mut bytes, delay)?;
+        Ok(GpioPinStatus::from_bytes(bytes))
+    }
+
+    /// Requests a state transition using previously configured radio parameters.
+    ///
+    /// CTS confirms command handling, not that the physical transition finished.
+    /// Check [`Self::request_device_state`] for the current state; SPI traffic can
+    /// wake a sleeping device. TX/RX require prior radio configuration.
+    /// For `Sleep`, only the pre-command CTS wait is performed, so the driver
+    /// does not immediately wake the radio with a completion poll. Returning
+    /// success then confirms the write, not completion of the sleep transition.
+    pub fn change_state<D: DelayNs>(
+        &mut self,
+        state: State,
+        delay: &mut D,
+    ) -> Result<(), Error<SPI::Error, SDN::Error>> {
+        let request = command::ChangeState(state).encode();
+        if state == State::Sleep {
+            self.wait_cts(delay)?;
+            self.write_request(&request)
+        } else {
+            self.command(&request, &mut [], delay)
+        }
+    }
+
+    /// Reads the current operating state and channel.
+    ///
+    /// The SPI request wakes a sleeping device into SPI_ACTIVE, so this cannot
+    /// be used to observe it remaining asleep.
+    pub fn request_device_state<D: DelayNs>(
+        &mut self,
+        delay: &mut D,
+    ) -> Result<DeviceState, Error<SPI::Error, SDN::Error>> {
+        let mut bytes = [0; DeviceState::LEN];
+        self.command(&command::RequestDeviceState.encode(), &mut bytes, delay)?;
+        Ok(DeviceState::from_bytes(bytes))
+    }
+
     /// Boots the selected firmware image after hardware reset.
     ///
     /// Returns `InvalidConfig` without SPI I/O for an oscillator frequency

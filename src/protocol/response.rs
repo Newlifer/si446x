@@ -1,5 +1,86 @@
 //! Raw response helpers and typed command responses.
 
+use super::{gpio::DriveStrength, state::State};
+
+/// Mode and sampled logic level returned for one radio pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinStatus {
+    /// Current mode code, preserved even if unknown.
+    pub mode: u8,
+    /// Sampled logic level (bit 7); bit 6 does not report pull-up configuration.
+    pub high: bool,
+}
+
+impl PinStatus {
+    /// Decodes a pin reply, ignoring its undefined bit 6.
+    pub const fn from_byte(byte: u8) -> Self {
+        Self {
+            mode: byte & 0x3f,
+            high: byte & 0x80 != 0,
+        }
+    }
+}
+
+/// GPIO configuration and levels returned by `GPIO_PIN_CFG`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpioPinStatus {
+    /// GPIO0 through GPIO3 modes and levels.
+    pub gpio: [PinStatus; 4],
+    /// NIRQ mode and level.
+    pub nirq: PinStatus,
+    /// SDO mode and level.
+    pub sdo: PinStatus,
+    /// Common output drive strength.
+    pub drive_strength: DriveStrength,
+}
+
+impl GpioPinStatus {
+    /// Response length excluding CTS.
+    pub const LEN: usize = 7;
+
+    /// Decodes a reply excluding CTS, ignoring undefined bits.
+    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self {
+            gpio: [
+                PinStatus::from_byte(bytes[0]),
+                PinStatus::from_byte(bytes[1]),
+                PinStatus::from_byte(bytes[2]),
+                PinStatus::from_byte(bytes[3]),
+            ],
+            nirq: PinStatus::from_byte(bytes[4]),
+            sdo: PinStatus::from_byte(bytes[5]),
+            drive_strength: DriveStrength::from_bits(bytes[6]),
+        }
+    }
+}
+
+/// Current operating state and tuned channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceState {
+    /// Raw main-state code (low nibble), preserved for unknown states.
+    pub main_state: u8,
+    /// Currently tuned channel.
+    pub channel: u8,
+}
+
+impl DeviceState {
+    /// Response length excluding CTS.
+    pub const LEN: usize = 2;
+
+    /// Decodes reply data, ignoring the undefined high nibble of CURR_STATE.
+    pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self {
+            main_state: bytes[0] & 0x0f,
+            channel: bytes[1],
+        }
+    }
+
+    /// Returns a known state, normalizing READY2 to READY.
+    pub const fn state(self) -> Option<State> {
+        State::from_current(self.main_state)
+    }
+}
+
 /// Chip identification returned by `PART_INFO`.
 ///
 /// Values are preserved as reported, including unknown part and revision IDs.
